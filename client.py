@@ -14,12 +14,15 @@ MODEL_RUN_CONFIGS = [
     {
         "model_type": "logistic_regression",
         "params": {"max_iter": 300},
+        # "params": {"kernel": "linear", "C": 1.0},
     },
     {
         "model_type": "random_forest",
         "params": {"n_estimators": 100, "random_state": 42},
     },
 ]
+
+FEATURES = [5.1, 3.5, 1.4, 0.2]
 
 def train_model(model_type="svm", params=None, dataset_path=DEFAULT_DATASET, log_prefix=""):
     if params is None:
@@ -81,14 +84,24 @@ def main(model_config=None, log_prefix=""):
             break
 
         if status["state"] == "failed":
-            print(f"{log_prefix}Training failed")
+            print(
+                f"{log_prefix}Training failed: "
+                f"{status.get('error_message', 'unknown internal error')}"
+            )
             return
 
         time.sleep(2)
 
     print(f"{log_prefix}Training finished")
 
-    result = infer(token, [5.1, 3.5, 1.4, 0.2])
+    result = infer(token, FEATURES)
+    if "error" in result:
+        print(
+            f"{log_prefix}Inference failed: {result['error']} "
+            f"{result.get('details', '')}".strip()
+        )
+        return
+
     print(f"{log_prefix}Inference result: {result}")
 
 

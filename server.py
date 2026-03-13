@@ -19,7 +19,7 @@ from core.config import (
 from core.db import (
     create_model_record,
     fetch_model_path_and_status,
-    fetch_model_status,
+    fetch_model_status_details,
     init_db,
     mark_token_failed,
 )
@@ -108,7 +108,7 @@ def _restart_worker(worker_id: str, reason: str):
 
     # If a worker dies mid-training, ensure that token does not stay in "training" forever.
     if reason in {"timeout", "dead"}:
-        mark_token_failed(token)
+        mark_token_failed(token, f"worker {reason} during training")
 
     with trainer_pool_lock:
         trainer_pool[worker_id] = spawn_trainer(worker_id)
@@ -204,12 +204,18 @@ def train(req: TrainRequest):
 @app.get("/status/{token}")
 def status(token: str):
 
-    model_status = fetch_model_status(token)
+    details = fetch_model_status_details(token)
 
-    if not model_status:
+    if not details:
         return {"error": "unknown token"}
 
-    return {"state": model_status}
+    model_status, error_message = details
+
+    response = {"state": model_status}
+    if error_message:
+        response["error_message"] = error_message
+
+    return response
 
 def load_model(path):
     return model_cache.load(path)
@@ -227,7 +233,13 @@ def infer_worker(token, features):
 
     X = np.array(features).reshape(1, -1)
 
-    pred = model.predict(X)
+    try:
+        pred = model.predict(X)
+    except Exception as exc:
+        return {
+            "error": "inference failed",
+            "details": f"{type(exc).__name__}: {exc}",
+        }
 
     return {"prediction": int(pred[0])}
 

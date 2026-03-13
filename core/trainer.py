@@ -3,8 +3,6 @@ from __future__ import annotations
 import os
 import resource
 import time
-from multiprocessing.synchronize import Lock
-from queue import Empty
 from typing import Any
 
 import joblib
@@ -57,11 +55,11 @@ def trainer_worker(job_queue, health_state, worker_id: str) -> None:
 
         token, dataset, model_type, params = job
         _heartbeat(health_state, worker_id, "training", token)
-        update_model_status(token, "training")
+        update_model_status(token, "training", None)
 
         try:
             train_model(token, dataset, model_type, params)
-        except Exception:
-            update_model_status(token, "failed")
+        except Exception as exc:
+            update_model_status(token, "failed", f"{type(exc).__name__}: {exc}")
         finally:
             _heartbeat(health_state, worker_id, "idle")
