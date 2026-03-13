@@ -153,6 +153,14 @@ def fetch_model_status(token: str) -> str | None:
     return row[0] if row else None
 
 
+def fetch_tokens_by_status(status: str) -> list[str]:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT token FROM models WHERE status=?", (status,))
+        rows = c.fetchall()
+    return [row[0] for row in rows]
+
+
 def fetch_model_status_details(token: str) -> tuple[str, str | None] | None:
     with get_conn() as conn:
         c = conn.cursor()

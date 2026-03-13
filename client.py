@@ -20,6 +20,14 @@ MODEL_RUN_CONFIGS = [
         "model_type": "random_forest",
         "params": {"n_estimators": 100, "random_state": 42},
     },
+    # {
+    #     "model_type": "random_forest",
+    #     "params": {"n_estimators": 100, "random_state": 42},
+    # },
+    # {
+    #     "model_type": "random_forest",
+    #     "params": {"n_estimators": 100, "random_state": 42},
+    # },
 ]
 
 FEATURES = [5.1, 3.5, 1.4, 0.2]
