@@ -106,7 +106,8 @@ def _restart_worker(worker_id: str, reason: str):
         proc.terminate()
         proc.join(timeout=2)
 
-    if reason == "timeout":
+    # If a worker dies mid-training, ensure that token does not stay in "training" forever.
+    if reason in {"timeout", "dead"}:
         mark_token_failed(token)
 
     with trainer_pool_lock:
