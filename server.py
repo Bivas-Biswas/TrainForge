@@ -2,6 +2,8 @@ import uuid
 import sqlite3
 import mmap
 import multiprocessing
+import threading
+from collections import OrderedDict
 
 from fastapi import FastAPI
 from concurrent.futures import ThreadPoolExecutor
@@ -21,8 +23,10 @@ manager = multiprocessing.Manager()
 job_queue = multiprocessing.Queue()
 
 TRAINER_COUNT = 20
+MODEL_CACHE_SIZE = 32
 
-model_cache = {}
+model_cache = OrderedDict()
+model_cache_lock = threading.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -122,18 +126,33 @@ def status(token: str):
 
 def load_model(path):
 
-    if path in model_cache:
-        return model_cache[path]
+    with model_cache_lock:
+        cached = model_cache.get(path)
 
-    f = open(path, "rb")
+        if cached is not None:
+            # Bump most recently used model to the end.
+            model_cache.move_to_end(path)
+            return cached
 
-    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(path, "rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            model = joblib.load(mm)
 
-    model = joblib.load(mm)
+    with model_cache_lock:
+        cached = model_cache.get(path)
 
-    model_cache[path] = model
+        if cached is not None:
+            model_cache.move_to_end(path)
+            return cached
 
-    return model
+        model_cache[path] = model
+        model_cache.move_to_end(path)
+
+        if len(model_cache) > MODEL_CACHE_SIZE:
+            # Drop least recently used model.
+            model_cache.popitem(last=False)
+
+        return model
 
 def infer_worker(token, features):
 
