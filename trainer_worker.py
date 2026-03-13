@@ -2,6 +2,7 @@ import os
 import sqlite3
 import joblib
 import resource
+import time
 import numpy as np
 from sklearn import svm
 
@@ -49,16 +50,31 @@ def train_model(token, dataset_path, params):
     conn.close()
     
 
-def trainer_worker(job_queue):
+def _heartbeat(health_state, worker_id, status, token=None):
+    health_state[worker_id] = {
+        "status": status,
+        "token": token,
+        "last_heartbeat": time.time(),
+    }
+
+
+def trainer_worker(job_queue, health_state, worker_id):
+
+    _heartbeat(health_state, worker_id, "idle")
 
     while True:
+
+        _heartbeat(health_state, worker_id, "idle")
 
         job = job_queue.get()
 
         if job is None:
+            _heartbeat(health_state, worker_id, "stopped")
             break
 
         token, dataset, params = job
+
+        _heartbeat(health_state, worker_id, "training", token)
 
         conn = sqlite3.connect("metadata.db")
         c = conn.cursor()
@@ -73,6 +89,7 @@ def trainer_worker(job_queue):
 
         try:
             train_model(token, dataset, params)
+            _heartbeat(health_state, worker_id, "idle")
 
         except Exception:
             conn = sqlite3.connect("metadata.db")
@@ -85,3 +102,5 @@ def trainer_worker(job_queue):
 
             conn.commit()
             conn.close()
+
+            _heartbeat(health_state, worker_id, "idle")
