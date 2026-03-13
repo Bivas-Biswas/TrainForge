@@ -8,7 +8,7 @@ from typing import Any
 import joblib
 
 from core.config import MAX_TRAIN_CPU_SECONDS, MAX_TRAIN_MEMORY_BYTES, MODEL_DIR
-from core.db import update_model_status
+from core.db import mark_model_completed, update_model_status
 from core.model_registry import build_model, load_dataset
 
 
@@ -31,7 +31,8 @@ def train_model(token: str, dataset_path: str, model_type: str, params: dict[str
     joblib.dump(model, tmp)
     os.replace(tmp, path)
 
-    update_model_status(token, "completed")
+    model_size_bytes = path.stat().st_size
+    mark_model_completed(token, model_size_bytes)
 
 
 def _heartbeat(health_state, worker_id: str, status: str, token: str | None = None) -> None:

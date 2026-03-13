@@ -22,6 +22,7 @@ from core.db import (
     fetch_model_status_details,
     init_db,
     mark_token_failed,
+    touch_last_inference_at,
 )
 from core.model_registry import MODEL_REGISTRY
 from core.schemas import InferRequest, TrainRequest
@@ -240,6 +241,8 @@ def infer_worker(token, features):
             "error": "inference failed",
             "details": f"{type(exc).__name__}: {exc}",
         }
+
+    touch_last_inference_at(token)
 
     return {"prediction": int(pred[0])}
 
