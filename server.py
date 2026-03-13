@@ -1,21 +1,31 @@
 import uuid
-import sqlite3
-import mmap
 import multiprocessing
 import threading
 import time
-from collections import OrderedDict
 
 from fastapi import FastAPI
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import numpy as np
-import joblib
-
-from trainer_worker import trainer_worker, MODEL_REGISTRY
-
-MODEL_DIR = "model_store"
+from core.cache import ModelCache
+from core.config import (
+    HEALTH_CHECK_INTERVAL_SEC,
+    MODEL_CACHE_SIZE,
+    MODEL_DIR,
+    TRAINER_COUNT,
+    TRAINER_TIMEOUT_SEC,
+)
+from core.db import (
+    create_model_record,
+    fetch_model_path_and_status,
+    fetch_model_status,
+    init_db,
+    mark_token_failed,
+)
+from core.model_registry import MODEL_REGISTRY
+from core.schemas import InferRequest, TrainRequest
+from core.trainer import trainer_worker
 
 executor = ThreadPoolExecutor(max_workers=10)
 
@@ -23,13 +33,7 @@ manager = multiprocessing.Manager()
 
 job_queue = multiprocessing.Queue()
 
-TRAINER_COUNT = 2
-MODEL_CACHE_SIZE = 32
-HEALTH_CHECK_INTERVAL_SEC = 5
-TRAINER_TIMEOUT_SEC = 300
-
-model_cache = OrderedDict()
-model_cache_lock = threading.Lock()
+model_cache = ModelCache(max_size=MODEL_CACHE_SIZE)
 trainer_pool = {}
 trainer_pool_lock = threading.Lock()
 trainer_health = manager.dict()
@@ -62,46 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-def init_db():
-    conn = sqlite3.connect("metadata.db")
-
-    c = conn.cursor()
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS models(
-        token TEXT PRIMARY KEY,
-        status TEXT,
-        path TEXT,
-        model_type TEXT DEFAULT 'svm'
-    )
-    """)
-
-    # Migrate existing tables that may lack the model_type column.
-    try:
-        c.execute("ALTER TABLE models ADD COLUMN model_type TEXT DEFAULT 'svm'")
-    except sqlite3.OperationalError:
-        pass
-
-    conn.commit()
-    conn.close()
-
 init_db()
-
-
-def mark_token_failed(token: str):
-    if not token:
-        return
-
-    conn = sqlite3.connect("metadata.db")
-    c = conn.cursor()
-
-    c.execute(
-        "UPDATE models SET status='failed' WHERE token=?",
-        (token,)
-    )
-
-    conn.commit()
-    conn.close()
 
 
 def spawn_trainer(worker_id: str):
@@ -212,13 +177,13 @@ def model_types():
 
 
 @app.post("/train")
-def train(req: dict):
+def train(req: TrainRequest):
 
     token = str(uuid.uuid4())
 
-    dataset = req["dataset_path"]
-    model_type = req.get("model_type", "svm")
-    params = req.get("params", {})
+    dataset = req.dataset_path
+    model_type = req.model_type
+    params = req.params
 
     if model_type not in MODEL_REGISTRY:
         return {
@@ -226,18 +191,10 @@ def train(req: dict):
             "supported_model_types": list(MODEL_REGISTRY),
         }
 
-    path = f"{MODEL_DIR}/{token}.bin"
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    path = str(MODEL_DIR / f"{token}.bin")
 
-    conn = sqlite3.connect("metadata.db")
-    c = conn.cursor()
-
-    c.execute(
-        "INSERT INTO models VALUES (?, ?, ?, ?)",
-        (token, "queued", path, model_type)
-    )
-
-    conn.commit()
-    conn.close()
+    create_model_record(token=token, status="queued", path=path, model_type=model_type)
 
     job_queue.put((token, dataset, model_type, params))
 
@@ -246,66 +203,21 @@ def train(req: dict):
 @app.get("/status/{token}")
 def status(token: str):
 
-    conn = sqlite3.connect("metadata.db")
-    c = conn.cursor()
+    model_status = fetch_model_status(token)
 
-    c.execute(
-        "SELECT status FROM models WHERE token=?",
-        (token,)
-    )
-
-    row = c.fetchone()
-
-    conn.close()
-
-    if not row:
+    if not model_status:
         return {"error": "unknown token"}
 
-    return {"state": row[0]}
+    return {"state": model_status}
 
 def load_model(path):
-
-    with model_cache_lock:
-        cached = model_cache.get(path)
-
-        if cached is not None:
-            # Bump most recently used model to the end.
-            model_cache.move_to_end(path)
-            return cached
-
-    with open(path, "rb") as f:
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            model = joblib.load(mm)
-
-    with model_cache_lock:
-        cached = model_cache.get(path)
-
-        if cached is not None:
-            model_cache.move_to_end(path)
-            return cached
-
-        model_cache[path] = model
-        model_cache.move_to_end(path)
-
-        if len(model_cache) > MODEL_CACHE_SIZE:
-            # Drop least recently used model.
-            model_cache.popitem(last=False)
-
-        return model
+    return model_cache.load(path)
 
 def infer_worker(token, features):
 
-    conn = sqlite3.connect("metadata.db")
-    c = conn.cursor()
-
-    c.execute(
-        "SELECT path,status FROM models WHERE token=?",
-        (token,)
-    )
-
-    row = c.fetchone()
-
-    conn.close()
+    row = fetch_model_path_and_status(token)
+    if row is None:
+        return {"error": "unknown token"}
 
     if row[1] != "completed":
         return {"error": "model not ready"}
@@ -320,10 +232,10 @@ def infer_worker(token, features):
 
 
 @app.post("/infer")
-def infer(req: dict):
+def infer(req: InferRequest):
 
-    token = req["token"]
-    features = req["features"]
+    token = req.token
+    features = req.features
 
     future = executor.submit(
         infer_worker,
