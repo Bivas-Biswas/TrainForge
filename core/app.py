@@ -15,8 +15,10 @@ from core.config import (
 )
 from core.db import (
     create_model_record,
+    fetch_client_storage_info,
     fetch_model_status_details,
     init_db,
+    is_client_over_storage_limit,
     register_client_activity,
 )
 from core.inference_service import InferenceService
@@ -61,6 +63,19 @@ def create_app() -> FastAPI:
         dataset = req.dataset_path
         model_type = req.model_type
         params = req.params
+
+        register_client_activity(client_id)
+        if is_client_over_storage_limit(client_id):
+            storage_info = fetch_client_storage_info(client_id)
+            total_models_storage_bytes, maximum_models_storage_support_bytes = (
+                storage_info if storage_info is not None else (0, 0)
+            )
+            return {
+                "error": "client storage quota exceeded",
+                "client_id": client_id,
+                "total_models_storage_bytes": total_models_storage_bytes,
+                "maximum_models_storage_support_bytes": maximum_models_storage_support_bytes,
+            }
 
         if model_type not in MODEL_REGISTRY:
             return {

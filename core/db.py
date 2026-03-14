@@ -179,6 +179,34 @@ def register_client_activity(
         )
 
 
+def fetch_client_storage_info(client_id: str) -> tuple[int, int] | None:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT total_models_storage_bytes, maximum_models_storage_support_bytes
+            FROM clients
+            WHERE client_id=?
+            """,
+            (client_id,),
+        )
+        row = c.fetchone()
+
+    if not row:
+        return None
+
+    return int(row[0]), int(row[1])
+
+
+def is_client_over_storage_limit(client_id: str) -> bool:
+    info = fetch_client_storage_info(client_id)
+    if info is None:
+        return False
+
+    total_models_storage_bytes, maximum_models_storage_support_bytes = info
+    return total_models_storage_bytes >= maximum_models_storage_support_bytes
+
+
 def _recompute_clients_storage(cursor: sqlite3.Cursor) -> None:
     cursor.execute(
         """
@@ -217,7 +245,7 @@ def create_model_record(
         )
 
 
-def mark_model_completed(token: str, model_size_bytes: int) -> None:
+def mark_model_completed(token: str, model_size_bytes: int) -> tuple[bool, str | None]:
     with get_conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -226,9 +254,47 @@ def mark_model_completed(token: str, model_size_bytes: int) -> None:
         )
         row = c.fetchone()
         if row is None:
-            return
+            return False, "unknown token"
 
         client_id, old_size = row[0], row[1] or 0
+
+        c.execute(
+            """
+            SELECT total_models_storage_bytes, maximum_models_storage_support_bytes
+            FROM clients
+            WHERE client_id=?
+            """,
+            (client_id,),
+        )
+        client_row = c.fetchone()
+
+        if client_row is None:
+            return False, "unknown client"
+
+        current_total = int(client_row[0])
+        maximum_supported = int(client_row[1])
+        proposed_total = current_total - old_size + model_size_bytes
+
+        if proposed_total > maximum_supported:
+            c.execute(
+                """
+                UPDATE models
+                SET status='failed', error_message=?
+                WHERE token=?
+                """,
+                (
+                    (
+                        "storage quota exceeded: "
+                        f"{proposed_total}/{maximum_supported} bytes"
+                    ),
+                    token,
+                ),
+            )
+            c.execute(
+                "UPDATE clients SET last_online_at=CURRENT_TIMESTAMP WHERE client_id=?",
+                (client_id,),
+            )
+            return False, "storage quota exceeded"
 
         c.execute(
             """
@@ -250,6 +316,8 @@ def mark_model_completed(token: str, model_size_bytes: int) -> None:
             """,
             (delta, client_id),
         )
+
+    return True, None
 
 
 def update_model_status(token: str, status: str, error_message: str | None = None) -> None:

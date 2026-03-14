@@ -32,7 +32,13 @@ def train_model(token: str, dataset_path: str, model_type: str, params: dict[str
     os.replace(tmp, path)
 
     model_size_bytes = path.stat().st_size
-    mark_model_completed(token, model_size_bytes)
+    completed, reason = mark_model_completed(token, model_size_bytes)
+    if not completed:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(reason or "failed to complete model")
 
 
 def _heartbeat(health_state, worker_id: str, status: str, token: str | None = None) -> None:
