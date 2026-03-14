@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS models(
     model_type TEXT DEFAULT 'svm',
     error_message TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_inference_at TIMESTAMP,
+    last_inference_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     model_size_bytes INTEGER
 )
 """
@@ -373,6 +373,93 @@ def fetch_model_path_and_status(token: str, client_id: str) -> tuple[str, str] |
         return None
 
     return row[0], row[1]
+
+
+def fetch_expired_models(inactive_ttl_sec: int, limit: int = 100) -> list[dict[str, Any]]:
+    threshold_modifier = f"-{inactive_ttl_sec} seconds"
+
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT
+                token,
+                client_id,
+                path,
+                COALESCE(model_size_bytes, 0),
+                status,
+                last_inference_at,
+                created_at,
+                CASE
+                    WHEN status='completed' THEN last_inference_at
+                    WHEN status='failed' THEN created_at
+                    ELSE NULL
+                END AS cleanup_reference_at
+            FROM models
+            WHERE
+                (
+                    status='completed'
+                    AND last_inference_at IS NOT NULL
+                    AND datetime(last_inference_at) <= datetime('now', ?)
+                )
+                OR
+                (
+                    status='failed'
+                    AND created_at IS NOT NULL
+                    AND datetime(created_at) <= datetime('now', ?)
+                )
+            ORDER BY datetime(cleanup_reference_at) ASC
+            LIMIT ?
+            """,
+            (threshold_modifier, threshold_modifier, limit),
+        )
+        rows = c.fetchall()
+
+    return [
+        {
+            "token": row[0],
+            "client_id": row[1],
+            "path": row[2],
+            "model_size_bytes": int(row[3] or 0),
+            "status": row[4],
+            "last_inference_at": row[5],
+            "created_at": row[6],
+            "cleanup_reference_at": row[7],
+        }
+        for row in rows
+    ]
+
+
+def delete_model_record(token: str) -> tuple[str | None, bool]:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT client_id, path, COALESCE(model_size_bytes, 0) FROM models WHERE token=?",
+            (token,),
+        )
+        row = c.fetchone()
+
+        if row is None:
+            return None, False
+
+        client_id, path, model_size_bytes = row[0], row[1], int(row[2] or 0)
+
+        c.execute("DELETE FROM models WHERE token=?", (token,))
+        if c.rowcount == 0:
+            return None, False
+
+        c.execute(
+            """
+            UPDATE clients
+            SET
+                total_models_storage_bytes=MAX(total_models_storage_bytes - ?, 0),
+                last_online_at=CURRENT_TIMESTAMP
+            WHERE client_id=?
+            """,
+            (model_size_bytes, client_id),
+        )
+
+    return path, True
 
 
 def mark_token_failed(token: str | None, reason: str | None = None) -> None:

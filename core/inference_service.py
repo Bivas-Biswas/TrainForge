@@ -13,6 +13,9 @@ class InferenceService:
     def _load_model(self, path: str):
         return self._model_cache.load(path)
 
+    def invalidate_model(self, path: str) -> None:
+        self._model_cache.invalidate(path)
+
     def infer(self, client_id: str, token: str, features: list[float]) -> dict:
         row = fetch_model_path_and_status(token, client_id)
         if row is None:

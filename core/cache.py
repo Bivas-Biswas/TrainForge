@@ -41,3 +41,8 @@ class ModelCache:
                 self._cache.popitem(last=False)
 
         return model
+
+    def invalidate(self, path: str | Path) -> None:
+        path_str = str(path)
+        with self._lock:
+            self._cache.pop(path_str, None)

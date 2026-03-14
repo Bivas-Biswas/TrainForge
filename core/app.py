@@ -8,8 +8,11 @@ from fastapi import FastAPI
 
 from core.config import (
     HEALTH_CHECK_INTERVAL_SEC,
+    MODEL_CLEANUP_BATCH_SIZE,
+    MODEL_CLEANUP_INTERVAL_SEC,
     MODEL_CACHE_SIZE,
     MODEL_DIR,
+    MODEL_INACTIVE_TTL_SEC,
     TRAINER_COUNT,
     TRAINER_TIMEOUT_SEC,
 )
@@ -22,6 +25,7 @@ from core.db import (
     register_client_activity,
 )
 from core.inference_service import InferenceService
+from core.model_cleanup import ModelCleanupService
 from core.model_registry import MODEL_REGISTRY
 from core.schemas import InferRequest, TrainRequest
 from core.trainer_pool import TrainerPool
@@ -36,12 +40,20 @@ def create_app() -> FastAPI:
         health_check_interval_sec=HEALTH_CHECK_INTERVAL_SEC,
     )
     inference_service = InferenceService(cache_size=MODEL_CACHE_SIZE)
+    model_cleanup_service = ModelCleanupService(
+        inactive_ttl_sec=MODEL_INACTIVE_TTL_SEC,
+        cleanup_interval_sec=MODEL_CLEANUP_INTERVAL_SEC,
+        cleanup_batch_size=MODEL_CLEANUP_BATCH_SIZE,
+        cache_invalidator=inference_service.invalidate_model,
+    )
     executor = ThreadPoolExecutor(max_workers=10)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         trainer_pool.start()
+        model_cleanup_service.start()
         yield
+        model_cleanup_service.stop()
         trainer_pool.stop()
         executor.shutdown(wait=False)
 
