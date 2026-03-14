@@ -3,11 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from core.config import DB_PATH
-
-
-DEFAULT_MAX_MODELS_STORAGE_SUPPORT_BYTES = 10 * 1024 * 1024 # 10MB
-
+from core.config import DB_PATH, DEFAULT_MAX_MODELS_STORAGE_SUPPORT_BYTES
 
 CREATE_CLIENTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS clients(
