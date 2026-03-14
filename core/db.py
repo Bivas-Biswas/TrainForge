@@ -6,9 +6,24 @@ from typing import Any
 from core.config import DB_PATH
 
 
-CREATE_TABLE_SQL = """
+DEFAULT_MAX_MODELS_STORAGE_SUPPORT_BYTES = 10 * 1024 * 1024 # 10MB
+
+
+CREATE_CLIENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS clients(
+    client_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_online_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    total_models_storage_bytes INTEGER NOT NULL DEFAULT 0,
+    maximum_models_storage_support_bytes INTEGER NOT NULL
+)
+"""
+
+
+CREATE_MODELS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS models(
     token TEXT PRIMARY KEY,
+    client_id TEXT,
     status TEXT,
     path TEXT,
     model_type TEXT DEFAULT 'svm',
@@ -34,6 +49,7 @@ def _migrate_last_inference_to_timestamp(cursor: sqlite3.Cursor) -> None:
         """
         CREATE TABLE IF NOT EXISTS models_new(
             token TEXT PRIMARY KEY,
+            client_id TEXT,
             status TEXT,
             path TEXT,
             model_type TEXT DEFAULT 'svm',
@@ -47,10 +63,11 @@ def _migrate_last_inference_to_timestamp(cursor: sqlite3.Cursor) -> None:
     cursor.execute(
         """
         INSERT INTO models_new (
-            token, status, path, model_type, error_message, created_at, last_inference_at, model_size_bytes
+            token, client_id, status, path, model_type, error_message, created_at, last_inference_at, model_size_bytes
         )
         SELECT
             token,
+            client_id,
             status,
             path,
             COALESCE(model_type, 'svm'),
@@ -72,7 +89,16 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute(CREATE_TABLE_SQL)
+        c.execute(CREATE_CLIENTS_TABLE_SQL)
+        c.execute(CREATE_MODELS_TABLE_SQL)
+
+        # Backfill a deterministic owner for legacy rows created before client support.
+        _register_client_activity(c, "legacy")
+
+        try:
+            c.execute("ALTER TABLE models ADD COLUMN client_id TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         # Backward-compatible migration for older DB files.
         try:
@@ -107,19 +133,87 @@ def init_db() -> None:
         c.execute(
             "UPDATE models SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL"
         )
+        c.execute("UPDATE models SET client_id='legacy' WHERE client_id IS NULL")
+
+        _recompute_clients_storage(c)
 
 
-def create_model_record(token: str, status: str, path: str, model_type: str) -> None:
+def _register_client_activity(
+    cursor: sqlite3.Cursor,
+    client_id: str,
+    maximum_models_storage_support_bytes: int | None = None,
+) -> None:
+    max_bytes = (
+        maximum_models_storage_support_bytes
+        if maximum_models_storage_support_bytes is not None
+        else DEFAULT_MAX_MODELS_STORAGE_SUPPORT_BYTES
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO clients (
+            client_id,
+            created_at,
+            last_online_at,
+            total_models_storage_bytes,
+            maximum_models_storage_support_bytes
+        )
+        VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0, ?)
+        ON CONFLICT(client_id) DO UPDATE SET
+            last_online_at=CURRENT_TIMESTAMP
+        """,
+        (client_id, max_bytes),
+    )
+
+
+def register_client_activity(
+    client_id: str,
+    maximum_models_storage_support_bytes: int | None = None,
+) -> None:
     with get_conn() as conn:
         c = conn.cursor()
+        _register_client_activity(
+            c,
+            client_id,
+            maximum_models_storage_support_bytes=maximum_models_storage_support_bytes,
+        )
+
+
+def _recompute_clients_storage(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(
+        """
+        UPDATE clients
+        SET total_models_storage_bytes = COALESCE(
+            (
+                SELECT SUM(models.model_size_bytes)
+                FROM models
+                WHERE models.client_id = clients.client_id
+                AND models.model_size_bytes IS NOT NULL
+            ),
+            0
+        )
+        """
+    )
+
+
+def create_model_record(
+    token: str,
+    client_id: str,
+    status: str,
+    path: str,
+    model_type: str,
+) -> None:
+    with get_conn() as conn:
+        c = conn.cursor()
+        _register_client_activity(c, client_id)
         c.execute(
             """
             INSERT INTO models (
-                token, status, path, model_type, error_message, created_at, last_inference_at, model_size_bytes
+                token, client_id, status, path, model_type, error_message, created_at, last_inference_at, model_size_bytes
             )
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL, NULL)
             """,
-            (token, status, path, model_type, None),
+            (token, client_id, status, path, model_type, None),
         )
 
 
@@ -127,12 +221,34 @@ def mark_model_completed(token: str, model_size_bytes: int) -> None:
     with get_conn() as conn:
         c = conn.cursor()
         c.execute(
+            "SELECT client_id, model_size_bytes FROM models WHERE token=?",
+            (token,),
+        )
+        row = c.fetchone()
+        if row is None:
+            return
+
+        client_id, old_size = row[0], row[1] or 0
+
+        c.execute(
             """
             UPDATE models
             SET status='completed', error_message=NULL, model_size_bytes=?
             WHERE token=?
             """,
             (model_size_bytes, token),
+        )
+
+        delta = model_size_bytes - old_size
+        c.execute(
+            """
+            UPDATE clients
+            SET
+                total_models_storage_bytes=MAX(total_models_storage_bytes + ?, 0),
+                last_online_at=CURRENT_TIMESTAMP
+            WHERE client_id=?
+            """,
+            (delta, client_id),
         )
 
 
@@ -161,10 +277,13 @@ def fetch_tokens_by_status(status: str) -> list[str]:
     return [row[0] for row in rows]
 
 
-def fetch_model_status_details(token: str) -> tuple[str, str | None] | None:
+def fetch_model_status_details(token: str, client_id: str) -> tuple[str, str | None] | None:
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT status, error_message FROM models WHERE token=?", (token,))
+        c.execute(
+            "SELECT status, error_message FROM models WHERE token=? AND client_id=?",
+            (token, client_id),
+        )
         row = c.fetchone()
 
     if not row:
@@ -173,10 +292,13 @@ def fetch_model_status_details(token: str) -> tuple[str, str | None] | None:
     return row[0], row[1]
 
 
-def fetch_model_path_and_status(token: str) -> tuple[str, str] | None:
+def fetch_model_path_and_status(token: str, client_id: str) -> tuple[str, str] | None:
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT path,status FROM models WHERE token=?", (token,))
+        c.execute(
+            "SELECT path,status FROM models WHERE token=? AND client_id=?",
+            (token, client_id),
+        )
         row = c.fetchone()
 
     if not row:
@@ -191,26 +313,44 @@ def mark_token_failed(token: str | None, reason: str | None = None) -> None:
     update_model_status(token, "failed", reason)
 
 
-def touch_last_inference_at(token: str) -> None:
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            "UPDATE models SET last_inference_at=CURRENT_TIMESTAMP WHERE token=?",
-            (token,),
-        )
-
-
-def fetch_model_record(token: str) -> dict[str, Any] | None:
+def touch_last_inference_at(token: str, client_id: str) -> None:
     with get_conn() as conn:
         c = conn.cursor()
         c.execute(
             """
-            SELECT token,status,path,model_type,error_message,created_at,last_inference_at,model_size_bytes
-            FROM models
-            WHERE token=?
+            UPDATE models
+            SET last_inference_at=CURRENT_TIMESTAMP
+            WHERE token=? AND client_id=?
             """,
-            (token,),
+            (token, client_id),
         )
+        c.execute(
+            "UPDATE clients SET last_online_at=CURRENT_TIMESTAMP WHERE client_id=?",
+            (client_id,),
+        )
+
+
+def fetch_model_record(token: str, client_id: str | None = None) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        c = conn.cursor()
+        if client_id is None:
+            c.execute(
+                """
+                SELECT token,client_id,status,path,model_type,error_message,created_at,last_inference_at,model_size_bytes
+                FROM models
+                WHERE token=?
+                """,
+                (token,),
+            )
+        else:
+            c.execute(
+                """
+                SELECT token,client_id,status,path,model_type,error_message,created_at,last_inference_at,model_size_bytes
+                FROM models
+                WHERE token=? AND client_id=?
+                """,
+                (token, client_id),
+            )
         row = c.fetchone()
 
     if not row:
@@ -218,11 +358,12 @@ def fetch_model_record(token: str) -> dict[str, Any] | None:
 
     return {
         "token": row[0],
-        "status": row[1],
-        "path": row[2],
-        "model_type": row[3],
-        "error_message": row[4],
-        "created_at": row[5],
-        "last_inference_at": row[6],
-        "model_size_bytes": row[7],
+        "client_id": row[1],
+        "status": row[2],
+        "path": row[3],
+        "model_type": row[4],
+        "error_message": row[5],
+        "created_at": row[6],
+        "last_inference_at": row[7],
+        "model_size_bytes": row[8],
     }

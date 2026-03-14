@@ -13,7 +13,12 @@ from core.config import (
     TRAINER_COUNT,
     TRAINER_TIMEOUT_SEC,
 )
-from core.db import create_model_record, fetch_model_status_details, init_db
+from core.db import (
+    create_model_record,
+    fetch_model_status_details,
+    init_db,
+    register_client_activity,
+)
 from core.inference_service import InferenceService
 from core.model_registry import MODEL_REGISTRY
 from core.schemas import InferRequest, TrainRequest
@@ -52,6 +57,7 @@ def create_app() -> FastAPI:
     def train(req: TrainRequest):
         token = str(uuid.uuid4())
 
+        client_id = req.client_id
         dataset = req.dataset_path
         model_type = req.model_type
         params = req.params
@@ -67,6 +73,7 @@ def create_app() -> FastAPI:
 
         create_model_record(
             token=token,
+            client_id=client_id,
             status="queued",
             path=path,
             model_type=model_type,
@@ -74,11 +81,17 @@ def create_app() -> FastAPI:
 
         trainer_pool.enqueue_job(token, dataset, model_type, params)
 
-        return {"token": token, "status": "queued", "model_type": model_type}
+        return {
+            "client_id": client_id,
+            "token": token,
+            "status": "queued",
+            "model_type": model_type,
+        }
 
     @app.get("/status/{token}")
-    def status(token: str):
-        details = fetch_model_status_details(token)
+    def status(token: str, client_id: str):
+        register_client_activity(client_id)
+        details = fetch_model_status_details(token, client_id)
 
         if not details:
             return {"error": "unknown token"}
@@ -93,7 +106,12 @@ def create_app() -> FastAPI:
 
     @app.post("/infer")
     def infer(req: InferRequest):
-        future = executor.submit(inference_service.infer, req.token, req.features)
+        future = executor.submit(
+            inference_service.infer,
+            req.client_id,
+            req.token,
+            req.features,
+        )
         return future.result()
 
     return app

@@ -139,6 +139,7 @@ Request:
 
 ```
 {
+  "client_id": "client-1",
   "dataset_path": "data/train.csv",
   "params": {
     "kernel": "linear",
@@ -164,6 +165,12 @@ Response:
 GET /status/{token}
 ```
 
+Query parameter:
+
+```
+client_id=client-1
+```
+
 Response:
 
 ```
@@ -184,6 +191,7 @@ Request:
 
 ```
 {
+  "client_id": "client-1",
   "token": "model-id",
   "features": [5.1, 3.5, 1.4, 0.2]
 }

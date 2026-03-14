@@ -32,11 +32,18 @@ MODEL_RUN_CONFIGS = [
 
 FEATURES = [5.1, 3.5, 1.4, 0.2]
 
-def train_model(model_type="svm", params=None, dataset_path=DEFAULT_DATASET, log_prefix=""):
+def train_model(
+    client_id,
+    model_type="svm",
+    params=None,
+    dataset_path=DEFAULT_DATASET,
+    log_prefix="",
+):
     if params is None:
         params = {}
 
     payload = {
+        "client_id": client_id,
         "model_type": model_type,
         "dataset_path": dataset_path,
         "params": params,
@@ -55,13 +62,14 @@ def train_model(model_type="svm", params=None, dataset_path=DEFAULT_DATASET, log
     return token
 
 
-def check_status(token):
-    r = requests.get(f"{SERVER}/status/{token}")
+def check_status(client_id, token):
+    r = requests.get(f"{SERVER}/status/{token}", params={"client_id": client_id})
     return r.json()
 
 
-def infer(token, features):
+def infer(client_id, token, features):
     payload = {
+        "client_id": client_id,
         "token": token,
         "features": features
     }
@@ -70,10 +78,11 @@ def infer(token, features):
     return r.json()
 
 
-def main(model_config=None, log_prefix=""):
+def main(client_id, model_config=None, log_prefix=""):
     model_config = model_config or MODEL_RUN_CONFIGS[0]
 
     token = train_model(
+        client_id=client_id,
         model_type=model_config["model_type"],
         params=model_config.get("params", {}),
         log_prefix=log_prefix,
@@ -85,7 +94,7 @@ def main(model_config=None, log_prefix=""):
     print(f"{log_prefix}Waiting for training...")
 
     while True:
-        status = check_status(token)
+        status = check_status(client_id, token)
         print(f"{log_prefix}Status: {status}")
 
         if status["state"] == "completed":
@@ -102,7 +111,7 @@ def main(model_config=None, log_prefix=""):
 
     print(f"{log_prefix}Training finished")
 
-    result = infer(token, FEATURES)
+    result = infer(client_id, token, FEATURES)
     if "error" in result:
         print(
             f"{log_prefix}Inference failed: {result['error']} "
@@ -118,8 +127,9 @@ def run_main_in_threads(thread_count=CLIENT_THREAD_COUNT):
 
     for index in range(thread_count):
         log_prefix = f"[thread-{index + 1}] "
+        client_id = f"client-{index + 1}"
         model_config = MODEL_RUN_CONFIGS[index % len(MODEL_RUN_CONFIGS)]
-        thread = threading.Thread(target=main, args=(model_config, log_prefix))
+        thread = threading.Thread(target=main, args=(client_id, model_config, log_prefix))
         thread.start()
         threads.append(thread)
 
