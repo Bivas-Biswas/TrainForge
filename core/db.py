@@ -198,6 +198,68 @@ def fetch_client_storage_info(client_id: str) -> tuple[int, int] | None:
     return int(row[0]), int(row[1])
 
 
+def fetch_client_details_with_models(client_id: str) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT
+                client_id,
+                created_at,
+                last_online_at,
+                total_models_storage_bytes,
+                maximum_models_storage_support_bytes
+            FROM clients
+            WHERE client_id=?
+            """,
+            (client_id,),
+        )
+        client_row = c.fetchone()
+
+        if client_row is None:
+            return None
+
+        c.execute(
+            """
+            SELECT
+                token,
+                status,
+                path,
+                model_type,
+                error_message,
+                created_at,
+                last_inference_at,
+                COALESCE(model_size_bytes, 0)
+            FROM models
+            WHERE client_id=?
+            ORDER BY datetime(created_at) DESC, token DESC
+            """,
+            (client_id,),
+        )
+        model_rows = c.fetchall()
+
+    return {
+        "client_id": client_row[0],
+        "created_at": client_row[1],
+        "last_online_at": client_row[2],
+        "total_models_storage_bytes": int(client_row[3]),
+        "maximum_models_storage_support_bytes": int(client_row[4]),
+        "models": [
+            {
+                "token": row[0],
+                "status": row[1],
+                "path": row[2],
+                "model_type": row[3],
+                "error_message": row[4],
+                "created_at": row[5],
+                "last_inference_at": row[6],
+                "model_size_bytes": int(row[7]),
+            }
+            for row in model_rows
+        ],
+    }
+
+
 def is_client_over_storage_limit(client_id: str) -> bool:
     info = fetch_client_storage_info(client_id)
     if info is None:
@@ -460,6 +522,61 @@ def delete_model_record(token: str) -> tuple[str | None, bool]:
         )
 
     return path, True
+
+
+def delete_client_model_record(client_id: str, token: str) -> tuple[str | None, bool]:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT client_id, path, COALESCE(model_size_bytes, 0)
+            FROM models
+            WHERE token=? AND client_id=?
+            """,
+            (token, client_id),
+        )
+        row = c.fetchone()
+
+        if row is None:
+            return None, False
+
+        _, path, model_size_bytes = row[0], row[1], int(row[2] or 0)
+
+        c.execute(
+            "DELETE FROM models WHERE token=? AND client_id=?",
+            (token, client_id),
+        )
+        if c.rowcount == 0:
+            return None, False
+
+        c.execute(
+            """
+            UPDATE clients
+            SET
+                total_models_storage_bytes=MAX(total_models_storage_bytes - ?, 0),
+                last_online_at=CURRENT_TIMESTAMP
+            WHERE client_id=?
+            """,
+            (model_size_bytes, client_id),
+        )
+
+    return path, True
+
+
+def delete_client_and_models(client_id: str) -> tuple[list[str], bool]:
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT client_id FROM clients WHERE client_id=?", (client_id,))
+        if c.fetchone() is None:
+            return [], False
+
+        c.execute("SELECT path FROM models WHERE client_id=?", (client_id,))
+        model_paths = [row[0] for row in c.fetchall() if row[0]]
+
+        c.execute("DELETE FROM models WHERE client_id=?", (client_id,))
+        c.execute("DELETE FROM clients WHERE client_id=?", (client_id,))
+
+    return model_paths, True
 
 
 def mark_token_failed(token: str | None, reason: str | None = None) -> None:

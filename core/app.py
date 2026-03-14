@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -18,6 +19,9 @@ from core.config import (
 )
 from core.db import (
     create_model_record,
+    delete_client_and_models,
+    delete_client_model_record,
+    fetch_client_details_with_models,
     fetch_client_storage_info,
     fetch_model_status_details,
     init_db,
@@ -140,5 +144,57 @@ def create_app() -> FastAPI:
             req.features,
         )
         return future.result()
+
+    @app.get("/clients/{client_id}")
+    def get_client_details(client_id: str):
+        register_client_activity(client_id)
+        details = fetch_client_details_with_models(client_id)
+        if details is None:
+            return {"error": "unknown client"}
+        return details
+
+    @app.delete("/clients/{client_id}")
+    def delete_client(client_id: str):
+        model_paths, deleted = delete_client_and_models(client_id)
+        if not deleted:
+            return {"error": "unknown client"}
+
+        removed_files = 0
+        for path in set(model_paths):
+            inference_service.invalidate_model(path)
+            try:
+                Path(path).unlink(missing_ok=True)
+                removed_files += 1
+            except OSError:
+                pass
+
+        return {
+            "client_id": client_id,
+            "deleted": True,
+            "deleted_models": len(model_paths),
+            "deleted_model_files": removed_files,
+        }
+
+    @app.delete("/clients/{client_id}/models/{token}")
+    def delete_client_model(client_id: str, token: str):
+        path, deleted = delete_client_model_record(client_id, token)
+        if not deleted:
+            return {"error": "unknown token for client"}
+
+        removed_file = False
+        if path:
+            inference_service.invalidate_model(path)
+            try:
+                Path(path).unlink(missing_ok=True)
+                removed_file = True
+            except OSError:
+                removed_file = False
+
+        return {
+            "client_id": client_id,
+            "token": token,
+            "deleted": True,
+            "deleted_model_file": removed_file,
+        }
 
     return app
